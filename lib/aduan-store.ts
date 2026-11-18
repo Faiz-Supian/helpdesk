@@ -1,6 +1,14 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import type { Aduan, CreateAduanPayload, UpdateAduanPayload } from './types';
+import { prisma } from './prisma';
+import type {
+  Aduan,
+  CreateAduanPayload,
+  KategoriKerosakan,
+  StatusAduan,
+  TahapKeutamaan,
+  UpdateAduanPayload,
+} from './types';
 
 const DATA_DIR = path.join(process.cwd(), 'data');
 const DATA_FILE = path.join(DATA_DIR, 'aduan.json');
@@ -138,7 +146,50 @@ const SEED_ADUAN: Aduan[] = [
   },
 ];
 
-// Global in-memory fallback for environments where filesystem writes may be restricted
+function isConfiguredPostgresUrl(url?: string): boolean {
+  if (!url) return false;
+  const trimmed = url.trim();
+  if (
+    !trimmed.startsWith('postgresql://') &&
+    !trimmed.startsWith('postgres://')
+  ) {
+    return false;
+  }
+  if (trimmed.includes('USER:PASSWORD@HOST')) {
+    return false;
+  }
+  return true;
+}
+
+const hasDatabaseUrl = isConfiguredPostgresUrl(process.env.DATABASE_URL);
+
+function mapDbRecord(record: {
+  id: string;
+  pengadu: string;
+  peranan_pengadu: string;
+  lokasi: string;
+  kategori_kerosakan: string;
+  tahap_keutamaan: string;
+  status: string;
+  penerangan: string;
+  tarikh_lapor: Date;
+  dikemaskini_pada: Date;
+}): Aduan {
+  return {
+    id: record.id,
+    pengadu: record.pengadu,
+    peranan_pengadu: record.peranan_pengadu === 'Staf' ? 'Staf' : 'Pelajar',
+    lokasi: record.lokasi,
+    kategori_kerosakan: record.kategori_kerosakan as KategoriKerosakan,
+    tahap_keutamaan: record.tahap_keutamaan as TahapKeutamaan,
+    status: record.status as StatusAduan,
+    penerangan: record.penerangan,
+    tarikh_lapor: record.tarikh_lapor.toISOString(),
+    dikemaskini_pada: record.dikemaskini_pada.toISOString(),
+  };
+}
+
+// Global in-memory fallback when DATABASE_URL is not configured or schema is not pushed yet
 const globalForAduan = globalThis as typeof globalThis & {
   __aduanMemoryStore?: Aduan[];
 };
@@ -178,20 +229,57 @@ async function persistStore(items: Aduan[]): Promise<void> {
   }
 }
 
+function nextTicketId(existingIds: string[]): string {
+  const maxNumber = existingIds.reduce((max, id) => {
+    const match = id.match(/ADU-\d+-(\d+)/);
+    const num = match ? parseInt(match[1], 10) : 0;
+    return num > max ? num : max;
+  }, 0);
+  return `ADU-2026-${String(maxNumber + 1).padStart(3, '0')}`;
+}
+
 export async function getAllAduan(): Promise<Aduan[]> {
+  if (hasDatabaseUrl) {
+    try {
+      const rows = await prisma.aduan.findMany({
+        orderBy: { tarikh_lapor: 'desc' },
+      });
+      return rows.map(mapDbRecord);
+    } catch {
+      // Fallback if table is not pushed yet or DB is unreachable in preview
+    }
+  }
+
   const items = await ensureStore();
   return [...items];
 }
 
 export async function createAduan(payload: CreateAduanPayload): Promise<Aduan> {
-  const items = await ensureStore();
-  const maxNumber = items.reduce((max, item) => {
-    const match = item.id.match(/ADU-\d+-(\d+)/);
-    const num = match ? parseInt(match[1], 10) : 0;
-    return num > max ? num : max;
-  }, 0);
+  if (hasDatabaseUrl) {
+    try {
+      const existing = await prisma.aduan.findMany({ select: { id: true } });
+      const id = nextTicketId(existing.map((r) => r.id));
 
-  const nextId = `ADU-2026-${String(maxNumber + 1).padStart(3, '0')}`;
+      const created = await prisma.aduan.create({
+        data: {
+          id,
+          pengadu: payload.pengadu.trim(),
+          peranan_pengadu: payload.peranan_pengadu,
+          lokasi: payload.lokasi.trim(),
+          kategori_kerosakan: payload.kategori_kerosakan,
+          tahap_keutamaan: payload.tahap_keutamaan,
+          status: 'Baru',
+          penerangan: payload.penerangan.trim(),
+        },
+      });
+      return mapDbRecord(created);
+    } catch {
+      // Fallback if table is not pushed yet or DB is unreachable in preview
+    }
+  }
+
+  const items = await ensureStore();
+  const nextId = nextTicketId(items.map((item) => item.id));
   const now = new Date().toISOString();
 
   const newAduan: Aduan = {
@@ -216,6 +304,35 @@ export async function updateAduan(
   id: string,
   payload: UpdateAduanPayload
 ): Promise<Aduan | null> {
+  if (hasDatabaseUrl) {
+    try {
+      const existing = await prisma.aduan.findUnique({ where: { id } });
+      if (!existing) return null;
+
+      const updated = await prisma.aduan.update({
+        where: { id },
+        data: {
+          ...(payload.status !== undefined ? { status: payload.status } : {}),
+          ...(payload.tahap_keutamaan !== undefined
+            ? { tahap_keutamaan: payload.tahap_keutamaan }
+            : {}),
+          ...(payload.lokasi !== undefined
+            ? { lokasi: payload.lokasi.trim() }
+            : {}),
+          ...(payload.kategori_kerosakan !== undefined
+            ? { kategori_kerosakan: payload.kategori_kerosakan }
+            : {}),
+          ...(payload.penerangan !== undefined
+            ? { penerangan: payload.penerangan.trim() }
+            : {}),
+        },
+      });
+      return mapDbRecord(updated);
+    } catch {
+      // Fallback if table is not pushed yet or DB is unreachable in preview
+    }
+  }
+
   const items = await ensureStore();
   const idx = items.findIndex((item) => item.id === id);
   if (idx === -1) return null;
@@ -244,6 +361,17 @@ export async function updateAduan(
 }
 
 export async function deleteAduan(id: string): Promise<boolean> {
+  if (hasDatabaseUrl) {
+    try {
+      const existing = await prisma.aduan.findUnique({ where: { id } });
+      if (!existing) return false;
+      await prisma.aduan.delete({ where: { id } });
+      return true;
+    } catch {
+      // Fallback if table is not pushed yet or DB is unreachable in preview
+    }
+  }
+
   const items = await ensureStore();
   const nextItems = items.filter((item) => item.id !== id);
   if (nextItems.length === items.length) return false;
